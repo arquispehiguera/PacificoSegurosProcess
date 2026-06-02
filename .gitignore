@@ -1,0 +1,37 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Sensitive configuration — never commit real credentials
+appsettings.json
+appsettings.*.json
+!appsettings.example.json
+
+# Local MCP config
+.mcp.json
+
+# ATL / agent internals
+.atl/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+logs/
