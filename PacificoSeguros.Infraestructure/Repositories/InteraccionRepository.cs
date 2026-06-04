@@ -24,19 +24,24 @@ namespace PacificoSeguros.Infraestructure.Repositories
                 SELECT LastInteractionId, ContactId, Celular, Proveedor, FechaIniLLamada,
                        Tipo, AgenteId, JsonIni, RespuestaIni, IdOracle, UrlOracle,
                        EnvioIniLLamada, FechaFinLLamada, JsonFin, RespuestaFin,
-                       EnvioFinLLamada, FechaRegistro
+                       EnvioFinLLamada, FechaRegistro, IdOportunidad
                 FROM GSS_OraclePacifico WITH(NOLOCK)
-                WHERE EnvioIniLLamada = 0";
+                WHERE EnvioIniLLamada = 0
+				AND CONVERT(VARCHAR(10), FechaIniLLamada, 112) = CONVERT(VARCHAR(10), GETDATE(), 112)";
+
             try
             {
-                using var connection = _context.CreateConnection();
-                connection.Open();
-                var result = await connection.QueryAsync<CtiInteraccion>(sql, commandType: CommandType.Text);
-                return result.ToList();
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<IReadOnlyList<CtiInteraccion>>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    var result = await connection.QueryAsync<CtiInteraccion>(sql, commandType: CommandType.Text);
+                    return result.ToList();
+                });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error al listar registros IniLLamada");
+                _logger.LogError(ex, "PopulateIniLLamada falló después de 2 reintentos");
                 throw;
             }
         }
@@ -47,19 +52,26 @@ namespace PacificoSeguros.Infraestructure.Repositories
                 SELECT LastInteractionId, ContactId, Celular, Proveedor, FechaIniLLamada,
                        Tipo, AgenteId, JsonIni, RespuestaIni, IdOracle, UrlOracle,
                        EnvioIniLLamada, FechaFinLLamada, JsonFin, RespuestaFin,
-                       EnvioFinLLamada, FechaRegistro
+                       EnvioFinLLamada, FechaRegistro, IdOportunidad
                 FROM GSS_OraclePacifico WITH(NOLOCK)
-                WHERE EnvioFinLLamada = 0 AND EnvioIniLLamada = 1";
+                WHERE EnvioFinLLamada = 0
+                    AND EnvioIniLLamada = 1
+				    AND FechaFinLLamada IS NOT NULL
+				    AND CONVERT(VARCHAR(10), FechaIniLLamada, 112) = CONVERT(VARCHAR(10), GETDATE(), 112)";
+
             try
             {
-                using var connection = _context.CreateConnection();
-                connection.Open();
-                var result = await connection.QueryAsync<CtiInteraccion>(sql, commandType: CommandType.Text);
-                return result.ToList();
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<IReadOnlyList<CtiInteraccion>>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    var result = await connection.QueryAsync<CtiInteraccion>(sql, commandType: CommandType.Text);
+                    return result.ToList();
+                });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error al listar registros FinLLamada");
+                _logger.LogError(ex, "PopulateFinLLamada falló después de 2 reintentos");
                 throw;
             }
         }
@@ -85,13 +97,16 @@ namespace PacificoSeguros.Infraestructure.Repositories
 
             try
             {
-                using var connection = _context.CreateConnection();
-                connection.Open();
-                return await connection.ExecuteAsync(sql, p) > 0;
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<bool>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    return await connection.ExecuteAsync(sql, p) > 0;
+                });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error en UpdateIniLLamada para {LastInteractionId}", lastInteractionId);
+                _logger.LogError(ex, "UpdateIniLLamada falló después de 2 reintentos para {LastInteractionId}", lastInteractionId);
                 throw;
             }
         }
@@ -113,13 +128,34 @@ namespace PacificoSeguros.Infraestructure.Repositories
 
             try
             {
-                using var connection = _context.CreateConnection();
-                connection.Open();
-                return await connection.ExecuteAsync(sql, p) > 0;
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<bool>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    return await connection.ExecuteAsync(sql, p) > 0;
+                });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error en UpdateFinLLamada para {LastInteractionId}", lastInteractionId);
+                _logger.LogError(ex, "UpdateFinLLamada falló después de 2 reintentos para {LastInteractionId}", lastInteractionId);
+                throw;
+            }
+        }
+
+        public async Task InsertMachineOracle()
+        {
+            try
+            {
+                await ResiliencePolicies.DbRetry.ExecuteAsync(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    await connection.ExecuteAsync("SppGss_App_InsertMachineOracle", commandType: CommandType.StoredProcedure);
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "InsertMachineOracle falló después de 2 reintentos");
                 throw;
             }
         }

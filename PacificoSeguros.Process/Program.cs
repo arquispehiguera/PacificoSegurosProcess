@@ -15,12 +15,16 @@ namespace SendDataRecruiting
     {
         static async Task Main(string[] args)
         {
-            string basePath = Debugger.IsAttached
-                ? AppContext.BaseDirectory
-                : Environment.GetEnvironmentVariable("PACIFICO_BASE_PATH") ?? @"C:\JobsDeployment\PacificoSeguros";
-
+            string basePath;
             if (Debugger.IsAttached)
-                Console.WriteLine($"Ejecutando en modo desarrollo: {basePath}");
+            {
+                basePath = AppContext.BaseDirectory;
+                Console.WriteLine($"🧩 Ejecutando en modo desarrollo: {basePath}");
+            }
+            else
+            {
+                basePath = @"C:\JobsDeployment\PacificoSegurosProcess";
+            }
 
             var configuration = new ConfigurationBuilder()
                 .SetBasePath(basePath)
@@ -33,6 +37,7 @@ namespace SendDataRecruiting
                 .Enrich.WithProperty("Application", "PacificoSegurosProcess")
                 .CreateLogger();
 
+         
             while (true)
             {
                 try

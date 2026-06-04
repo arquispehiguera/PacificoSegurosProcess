@@ -69,7 +69,7 @@ namespace PacificoSeguros.Process.Services
                 {
                     using var scope = _serviceProvider.CreateScope();
                     var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
-
+                    await repo.InsertMachineOracle();
                     var iniRecords = await repo.PopulateIniLLamada();
                     _logger.LogInformation("[DEBUG] {Count} registros IniLLamada encontrados", iniRecords.Count);
                     foreach (var record in iniRecords)
@@ -114,7 +114,7 @@ namespace PacificoSeguros.Process.Services
                 {
                     using var scope = _serviceProvider.CreateScope();
                     var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
-
+                    await repo.InsertMachineOracle();
                     var iniRecords = await repo.PopulateIniLLamada();
                     if (iniRecords.Any())
                     {
@@ -122,7 +122,6 @@ namespace PacificoSeguros.Process.Services
                         foreach (var r in iniRecords)
                             await _iniChannel.Writer.WriteAsync(r, ct);
                     }
-
                     var finRecords = await repo.PopulateFinLLamada();
                     if (finRecords.Any())
                     {
@@ -130,7 +129,6 @@ namespace PacificoSeguros.Process.Services
                         foreach (var r in finRecords)
                             await _finChannel.Writer.WriteAsync(r, ct);
                     }
-
                     await Task.Delay(TimeSpan.FromSeconds(_pollingIntervalSeconds), ct);
                 }
                 catch (OperationCanceledException) { break; }
@@ -140,7 +138,6 @@ namespace PacificoSeguros.Process.Services
                     await Task.Delay(TimeSpan.FromSeconds(_pollingIntervalSeconds), ct);
                 }
             }
-
             _iniChannel.Writer.Complete();
             _finChannel.Writer.Complete();
             _logger.LogInformation("Producer detenido");
@@ -201,7 +198,7 @@ namespace PacificoSeguros.Process.Services
                 dInicio_c = FormatFecha(record.FechaIniLLamada),
                 tUCID_c = record.LastInteractionId,
                 chTipo_c = record.Tipo,
-                chOpty_Id_c = long.TryParse(record.ContactId, out var cid) ? cid : 0,
+                chOpty_Id_c = record.IdOportunidad,
                 tUsuarioNumDoc_c = record.AgenteId
             };
 
@@ -209,9 +206,7 @@ namespace PacificoSeguros.Process.Services
 
             int envio = response?.Id > 0 ? 1 : 3;
             long idOracle = response?.Id ?? 0;
-            string urlOracle = response?.Id > 0
-                ? _oracleClient.BuildFinLlamadaUrl(response!.Id)
-                : string.Empty;
+            string urlOracle = response?.tURL_c??"";
 
             await repo.UpdateIniLLamada(
                 JsonConvert.SerializeObject(request),
@@ -225,9 +220,7 @@ namespace PacificoSeguros.Process.Services
         private async Task ProcessFinLlamada(IInteraccionRepository repo, CtiInteraccion record)
         {
             var request = new OracleFinLlamadaRequest { dFin_c = FormatFecha(record.FechaFinLLamada) };
-
-            string? responseBody = await _oracleClient.FinalizarGestionAsync(record.UrlOracle!, request);
-
+            string? responseBody = await _oracleClient.FinalizarGestionAsync( request,record.IdOracle ?? 0L);
             await repo.UpdateFinLLamada(
                 JsonConvert.SerializeObject(request),
                 responseBody ?? string.Empty,

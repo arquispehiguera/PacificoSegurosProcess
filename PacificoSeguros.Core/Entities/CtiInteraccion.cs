@@ -19,5 +19,7 @@ namespace PacificoSeguros.Core.Entities
         public string? RespuestaFin { get; set; }
         public int EnvioFinLLamada { get; set; } = 0;
         public DateTime FechaRegistro { get; set; } = DateTime.Now;
+        public long IdOportunidad { get; set; } = 0;
+        
     }
 }
