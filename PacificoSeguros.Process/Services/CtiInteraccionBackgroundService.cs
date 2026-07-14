@@ -17,6 +17,8 @@ namespace PacificoSeguros.Process.Services
         private readonly IServiceProvider _serviceProvider;
         private readonly IConfiguration _configuration;
         private readonly IOracleApiClient _oracleClient;
+        private readonly IHeartbeatMonitor _producerHeartbeat;
+        private readonly IHeartbeatMonitor _consumersHeartbeat;
 
         private readonly Channel<CtiInteraccion> _iniChannel;
         private readonly Channel<CtiInteraccion> _finChannel;
@@ -28,12 +30,16 @@ namespace PacificoSeguros.Process.Services
             ILogger<CtiInteraccionBackgroundService> logger,
             IServiceProvider serviceProvider,
             IConfiguration configuration,
-            IOracleApiClient oracleClient)
+            IOracleApiClient oracleClient,
+            [FromKeyedServices("Producer")] IHeartbeatMonitor producerHeartbeat,
+            [FromKeyedServices("Consumers")] IHeartbeatMonitor consumersHeartbeat)
         {
             _logger = logger;
             _serviceProvider = serviceProvider;
             _configuration = configuration;
             _oracleClient = oracleClient;
+            _producerHeartbeat = producerHeartbeat;
+            _consumersHeartbeat = consumersHeartbeat;
             _pollingIntervalSeconds = configuration.GetValue<int>("OracleApi:PollingIntervalSeconds", 10);
             _maxConcurrentWorkers = configuration.GetValue<int>("OracleApi:MaxConcurrentWorkers", 5);
 
@@ -74,11 +80,15 @@ namespace PacificoSeguros.Process.Services
                     _logger.LogInformation("[DEBUG] {Count} registros IniLLamada encontrados", iniRecords.Count);
                     foreach (var record in iniRecords)
                     {
-                        using (LogContext.PushProperty("Celular", record.Celular))
-                        using (LogContext.PushProperty("ContactId", record.ContactId))
+                        // La columna de BD se llama "ContactId" porque otra aplicación distinta ya lee
+                        // de esa misma columna en GSS_LogPacifico — no se puede renombrar sin
+                        // romperle la lectura. Reusamos la columna, mandamos LastInteractionId
+                        // como valor (es la clave que de verdad importa para correlacionar).
+                        using (LogContext.PushProperty("Celular", MaskCelular(record.Celular)))
+                        using (LogContext.PushProperty("ContactId", record.LastInteractionId))
                         {
                             _logger.LogInformation("[DEBUG] Procesando IniLLamada: {LI}", record.LastInteractionId);
-                            await ProcessIniLlamada(repo, record);
+                            _ = await ProcessIniLlamada(repo, record);
                         }
                     }
 
@@ -86,14 +96,22 @@ namespace PacificoSeguros.Process.Services
                     _logger.LogInformation("[DEBUG] {Count} registros FinLLamada encontrados", finRecords.Count);
                     foreach (var record in finRecords)
                     {
-                        using (LogContext.PushProperty("Celular", record.Celular))
-                        using (LogContext.PushProperty("ContactId", record.ContactId))
+                        // La columna de BD se llama "ContactId" porque otra aplicación distinta ya lee
+                        // de esa misma columna en GSS_LogPacifico — no se puede renombrar sin
+                        // romperle la lectura. Reusamos la columna, mandamos LastInteractionId
+                        // como valor (es la clave que de verdad importa para correlacionar).
+                        using (LogContext.PushProperty("Celular", MaskCelular(record.Celular)))
+                        using (LogContext.PushProperty("ContactId", record.LastInteractionId))
                         {
                             _logger.LogInformation("[DEBUG] Procesando FinLLamada: {LI}", record.LastInteractionId);
-                            await ProcessFinLlamada(repo, record);
+                            _ = await ProcessFinLlamada(repo, record);
                         }
                     }
 
+                    _producerHeartbeat.ReportAlive();
+                    _producerHeartbeat.ReportProgress();
+                    _consumersHeartbeat.ReportAlive();
+                    _consumersHeartbeat.ReportProgress();
                     await Task.Delay(TimeSpan.FromSeconds(_pollingIntervalSeconds), ct);
                 }
                 catch (OperationCanceledException) { break; }
@@ -129,6 +147,8 @@ namespace PacificoSeguros.Process.Services
                         foreach (var r in finRecords)
                             await _finChannel.Writer.WriteAsync(r, ct);
                     }
+                    _producerHeartbeat.ReportAlive();
+                    _producerHeartbeat.ReportProgress();
                     await Task.Delay(TimeSpan.FromSeconds(_pollingIntervalSeconds), ct);
                 }
                 catch (OperationCanceledException) { break; }
@@ -143,24 +163,87 @@ namespace PacificoSeguros.Process.Services
             _logger.LogInformation("Producer detenido");
         }
 
+        // El await foreach de ReadAllAsync bloquea sin ejecutar el cuerpo mientras el
+        // channel está vacío — con eso, ReportAlive()/ReportProgress() no se llaman
+        // durante ventanas de baja actividad (de noche, fin de semana), y el Watchdog
+        // termina reiniciando el proceso creyendo que está colgado cuando en realidad
+        // no hay nada para procesar. Este intervalo hace que el worker "avise que sigue
+        // vivo" aunque el channel esté vacío, sin necesidad de que llegue trabajo real.
+        private static readonly TimeSpan IdleHeartbeatInterval = TimeSpan.FromSeconds(15);
+
         private async Task IniConsumerTask(int workerId, CancellationToken ct)
         {
-            await foreach (var record in _iniChannel.Reader.ReadAllAsync(ct))
+            while (!ct.IsCancellationRequested)
             {
-                using (LogContext.PushProperty("Celular", record.Celular))
-                using (LogContext.PushProperty("ContactId", record.ContactId))
+                bool hasData;
+                try
                 {
-                    try
+                    var waitTask = _iniChannel.Reader.WaitToReadAsync(ct).AsTask();
+                    var idleTask = Task.Delay(IdleHeartbeatInterval, ct);
+                    if (await Task.WhenAny(waitTask, idleTask) == idleTask)
                     {
-                        using var scope = _serviceProvider.CreateScope();
-                        var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
-                        _logger.LogInformation("Worker-Ini #{Id} procesando {LI}", workerId, record.LastInteractionId);
-                        await ProcessIniLlamada(repo, record);
-                        _logger.LogInformation("Worker-Ini #{Id} completó {LI}", workerId, record.LastInteractionId);
+                        // Sin trabajo pendiente hace un rato — no es un hang, es que no
+                        // hay nada para hacer. El worker sigue vivo y al día.
+                        _consumersHeartbeat.ReportAlive();
+                        _consumersHeartbeat.ReportProgress();
+                        continue;
                     }
-                    catch (Exception ex)
+                    hasData = await waitTask;
+                }
+                catch (OperationCanceledException) { break; }
+
+                if (!hasData) break; // Producer cerró el channel
+
+                // El !ct.IsCancellationRequested acá es necesario: sin él, si el shutdown
+                // arranca mientras hay ítems en cola, este loop los sigue drenando igual
+                // y cada uno choca contra el IServiceProvider ya disposed del Host —
+                // una ráfaga de ObjectDisposedException, uno por ítem pendiente, en vez
+                // de cortar prolijo apenas se pide la cancelación.
+                while (!ct.IsCancellationRequested && _iniChannel.Reader.TryRead(out var record))
+                {
+                    // La columna de BD se llama "ContactId" porque otra aplicación distinta ya lee
+                    // de esa misma columna en GSS_LogPacifico — no se puede renombrar sin
+                    // romperle la lectura. Reusamos la columna, mandamos LastInteractionId
+                    // como valor (es la clave que de verdad importa para correlacionar).
+                    using (LogContext.PushProperty("Celular", MaskCelular(record.Celular)))
+                    using (LogContext.PushProperty("ContactId", record.LastInteractionId))
                     {
-                        _logger.LogError(ex, "Worker-Ini #{Id} falló en {LI}", workerId, record.LastInteractionId);
+                        try
+                        {
+                            using var scope = _serviceProvider.CreateScope();
+                            var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
+                            var outcome = await ProcessIniLlamada(repo, record);
+                            if (outcome == ApiOutcome.TransientFailure)
+                            {
+                                _logger.LogDebug("Worker-Ini #{Id}: falla transitoria en {LI}, se reintentará en el próximo ciclo", workerId, record.LastInteractionId);
+                            }
+                            else
+                            {
+                                // Success no loguea nada acá — es el caso esperado, la
+                                // mayoría de los ítems, y loguearlo uno por uno satura el
+                                // archivo sin aportar señal. PermanentFailure sí interesa
+                                // ver (poco volumen, y OracleApiClient ya lo logueó con
+                                // más detalle — esto solo correlaciona qué worker lo tomó).
+                                if (outcome == ApiOutcome.PermanentFailure)
+                                    _logger.LogInformation("Worker-Ini #{Id}: falla permanente en {LI}", workerId, record.LastInteractionId);
+                                _consumersHeartbeat.ReportProgress();
+                            }
+                            _consumersHeartbeat.ReportAlive();
+                        }
+                        // El filtro distingue una falla real de negocio de un efecto
+                        // colateral esperado del apagado (ej. ObjectDisposedException
+                        // del IServiceProvider si el Host empezó a disponerse justo
+                        // mientras este ítem se estaba procesando) — lo segundo no es
+                        // un "falló", es el proceso cerrando prolijo, y no corresponde
+                        // loguearlo como error.
+                        catch (Exception ex) when (!ct.IsCancellationRequested)
+                        {
+                            _logger.LogError(ex, "Worker-Ini #{Id} falló en {LI}", workerId, record.LastInteractionId);
+                        }
+                        catch (Exception)
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -168,28 +251,65 @@ namespace PacificoSeguros.Process.Services
 
         private async Task FinConsumerTask(int workerId, CancellationToken ct)
         {
-            await foreach (var record in _finChannel.Reader.ReadAllAsync(ct))
+            while (!ct.IsCancellationRequested)
             {
-                using (LogContext.PushProperty("Celular", record.Celular))
-                using (LogContext.PushProperty("ContactId", record.ContactId))
+                bool hasData;
+                try
                 {
-                    try
+                    var waitTask = _finChannel.Reader.WaitToReadAsync(ct).AsTask();
+                    var idleTask = Task.Delay(IdleHeartbeatInterval, ct);
+                    if (await Task.WhenAny(waitTask, idleTask) == idleTask)
                     {
-                        using var scope = _serviceProvider.CreateScope();
-                        var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
-                        _logger.LogInformation("Worker-Fin #{Id} procesando {LI}", workerId, record.LastInteractionId);
-                        await ProcessFinLlamada(repo, record);
-                        _logger.LogInformation("Worker-Fin #{Id} completó {LI}", workerId, record.LastInteractionId);
+                        _consumersHeartbeat.ReportAlive();
+                        _consumersHeartbeat.ReportProgress();
+                        continue;
                     }
-                    catch (Exception ex)
+                    hasData = await waitTask;
+                }
+                catch (OperationCanceledException) { break; }
+
+                if (!hasData) break;
+
+                while (!ct.IsCancellationRequested && _finChannel.Reader.TryRead(out var record))
+                {
+                    // La columna de BD se llama "ContactId" porque otra aplicación distinta ya lee
+                    // de esa misma columna en GSS_LogPacifico — no se puede renombrar sin
+                    // romperle la lectura. Reusamos la columna, mandamos LastInteractionId
+                    // como valor (es la clave que de verdad importa para correlacionar).
+                    using (LogContext.PushProperty("Celular", MaskCelular(record.Celular)))
+                    using (LogContext.PushProperty("ContactId", record.LastInteractionId))
                     {
-                        _logger.LogError(ex, "Worker-Fin #{Id} falló en {LI}", workerId, record.LastInteractionId);
+                        try
+                        {
+                            using var scope = _serviceProvider.CreateScope();
+                            var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
+                            var outcome = await ProcessFinLlamada(repo, record);
+                            if (outcome == ApiOutcome.TransientFailure)
+                            {
+                                _logger.LogDebug("Worker-Fin #{Id}: falla transitoria en {LI}, se reintentará en el próximo ciclo", workerId, record.LastInteractionId);
+                            }
+                            else
+                            {
+                                if (outcome == ApiOutcome.PermanentFailure)
+                                    _logger.LogInformation("Worker-Fin #{Id}: falla permanente en {LI}", workerId, record.LastInteractionId);
+                                _consumersHeartbeat.ReportProgress();
+                            }
+                            _consumersHeartbeat.ReportAlive();
+                        }
+                        catch (Exception ex) when (!ct.IsCancellationRequested)
+                        {
+                            _logger.LogError(ex, "Worker-Fin #{Id} falló en {LI}", workerId, record.LastInteractionId);
+                        }
+                        catch (Exception)
+                        {
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        private async Task ProcessIniLlamada(IInteraccionRepository repo, CtiInteraccion record)
+        private async Task<ApiOutcome> ProcessIniLlamada(IInteraccionRepository repo, CtiInteraccion record)
         {
             var request = new OracleIniLlamadaRequest
             {
@@ -202,11 +322,14 @@ namespace PacificoSeguros.Process.Services
                 tUsuarioNumDoc_c = record.AgenteId
             };
 
-            var response = await _oracleClient.IniciarGestionAsync(request);
+            var (outcome, response) = await _oracleClient.IniciarGestionAsync(request);
 
-            int envio = response?.Id > 0 ? 1 : 3;
+            if (outcome == ApiOutcome.TransientFailure)
+                return outcome; // no se toca la fila, sigue en Envio=0 para el próximo ciclo
+
+            int envio = outcome == ApiOutcome.Success && response?.Id > 0 ? 1 : 3;
             long idOracle = response?.Id ?? 0;
-            string urlOracle = response?.tURL_c??"";
+            string urlOracle = response?.tURL_c ?? "";
 
             await repo.UpdateIniLLamada(
                 JsonConvert.SerializeObject(request),
@@ -215,20 +338,38 @@ namespace PacificoSeguros.Process.Services
                 record.LastInteractionId!,
                 idOracle,
                 urlOracle);
+
+            return outcome;
         }
 
-        private async Task ProcessFinLlamada(IInteraccionRepository repo, CtiInteraccion record)
+        private async Task<ApiOutcome> ProcessFinLlamada(IInteraccionRepository repo, CtiInteraccion record)
         {
             var request = new OracleFinLlamadaRequest { dFin_c = FormatFecha(record.FechaFinLLamada) };
-            string? responseBody = await _oracleClient.FinalizarGestionAsync( request,record.IdOracle ?? 0L);
+            var (outcome, responseBody) = await _oracleClient.FinalizarGestionAsync(request, record.IdOracle ?? 0L);
+
+            if (outcome == ApiOutcome.TransientFailure)
+                return outcome;
+
             await repo.UpdateFinLLamada(
                 JsonConvert.SerializeObject(request),
                 responseBody ?? string.Empty,
-                responseBody != null ? 1 : 3,
+                outcome == ApiOutcome.Success ? 1 : 3,
                 record.LastInteractionId!);
+
+            return outcome;
         }
 
         private static string FormatFecha(DateTime? fecha) =>
             fecha.HasValue ? fecha.Value.ToString("yyyy-MM-ddTHH:mm:ss.fff-05:00") : string.Empty;
+
+        // El celular es PII y termina en GSS_LogPacifico y en el archivo de log en
+        // disco — no hace falta el número completo para correlacionar/depurar, alcanza
+        // con los últimos 4 dígitos.
+        private static string MaskCelular(string? celular)
+        {
+            if (string.IsNullOrEmpty(celular))
+                return string.Empty;
+            return celular.Length <= 4 ? celular : $"***{celular[^4..]}";
+        }
     }
 }

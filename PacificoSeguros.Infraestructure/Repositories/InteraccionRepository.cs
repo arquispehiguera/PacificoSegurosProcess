@@ -20,14 +20,21 @@ namespace PacificoSeguros.Infraestructure.Repositories
 
         public async Task<IReadOnlyList<CtiInteraccion>> PopulateIniLLamada()
         {
+            // GETDATE() en este SQL Server corre ~5 horas adelantado respecto a la hora
+            // local del negocio (confirmado con SELECT GETDATE() en producción). Sin el
+            // DATEADD(HOUR,-5,...), cualquier registro creado entre ~19hs y medianoche
+            // hora local quedaría permanentemente fuera del filtro de "hoy" — el server
+            // ya cree que es el día siguiente. Si algún día se corrige el reloj del
+            // server, este ajuste hay que sacarlo.
             const string sql = @"
-                SELECT LastInteractionId, ContactId, Celular, Proveedor, FechaIniLLamada,
+                SELECT LastInteractionId, Celular, Proveedor, FechaIniLLamada,
                        Tipo, AgenteId, JsonIni, RespuestaIni, IdOracle, UrlOracle,
                        EnvioIniLLamada, FechaFinLLamada, JsonFin, RespuestaFin,
                        EnvioFinLLamada, FechaRegistro, IdOportunidad
                 FROM GSS_OraclePacifico WITH(NOLOCK)
                 WHERE EnvioIniLLamada = 0
-				AND CONVERT(VARCHAR(10), FechaIniLLamada, 112) = CONVERT(VARCHAR(10), GETDATE(), 112)";
+                    AND FechaIniLLamada >= CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE)
+                    AND FechaIniLLamada <  DATEADD(DAY, 1, CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE))";
 
             try
             {
@@ -48,16 +55,18 @@ namespace PacificoSeguros.Infraestructure.Repositories
 
         public async Task<IReadOnlyList<CtiInteraccion>> PopulateFinLLamada()
         {
+            // Mismo ajuste de reloj que PopulateIniLLamada — ver comentario ahí.
             const string sql = @"
-                SELECT LastInteractionId, ContactId, Celular, Proveedor, FechaIniLLamada,
+                SELECT LastInteractionId, Celular, Proveedor, FechaIniLLamada,
                        Tipo, AgenteId, JsonIni, RespuestaIni, IdOracle, UrlOracle,
                        EnvioIniLLamada, FechaFinLLamada, JsonFin, RespuestaFin,
                        EnvioFinLLamada, FechaRegistro, IdOportunidad
                 FROM GSS_OraclePacifico WITH(NOLOCK)
                 WHERE EnvioFinLLamada = 0
                     AND EnvioIniLLamada = 1
-				    AND FechaFinLLamada IS NOT NULL
-				    AND CONVERT(VARCHAR(10), FechaIniLLamada, 112) = CONVERT(VARCHAR(10), GETDATE(), 112)";
+                    AND FechaFinLLamada IS NOT NULL
+                    AND FechaIniLLamada >= CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE)
+                    AND FechaIniLLamada <  DATEADD(DAY, 1, CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE))";
 
             try
             {

@@ -3,7 +3,6 @@ namespace PacificoSeguros.Core.Entities
     public class CtiInteraccion
     {
         public string LastInteractionId { get; set; } = string.Empty;
-        public string? ContactId { get; set; }
         public string? Celular { get; set; }
         public string Proveedor { get; set; } = "COVISIAN";
         public DateTime? FechaIniLLamada { get; set; }
