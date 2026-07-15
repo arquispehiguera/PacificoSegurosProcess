@@ -26,6 +26,7 @@ namespace PacificoSeguros.Process.Services
         private readonly int _pollingIntervalSeconds;
         private readonly int _maxConcurrentWorkers;
         private readonly int _batchSize;
+        private readonly int _claimTimeoutMinutes;
 
         public CtiInteraccionBackgroundService(
             ILogger<CtiInteraccionBackgroundService> logger,
@@ -48,6 +49,12 @@ namespace PacificoSeguros.Process.Services
             // rate limiter de OracleApiClient (100/min), que aplica sin importar cuánto
             // traiga acá. Este valor solo evita reservar de más entre un poll y el siguiente.
             _batchSize = configuration.GetValue<int>("OracleApi:BatchSize", 20);
+            // Umbral para dar por huérfana una fila en Envio=2 y devolverla a 0. Con margen
+            // sobre el peor caso razonable (una fila esperando turno en el Channel durante
+            // un backlog grande), no sobre el caso típico (que resuelve en segundos). Nunca
+            // reclama una fila en Envio=4 — ese estado significa que Oracle ya confirmó y
+            // es intocable por diseño.
+            _claimTimeoutMinutes = configuration.GetValue<int>("OracleApi:ClaimTimeoutMinutes", 20);
 
             _iniChannel = Channel.CreateUnbounded<CtiInteraccion>(new UnboundedChannelOptions { SingleWriter = true });
             _finChannel = Channel.CreateUnbounded<CtiInteraccion>(new UnboundedChannelOptions { SingleWriter = true });
@@ -159,6 +166,18 @@ namespace PacificoSeguros.Process.Services
                     using var scope = _serviceProvider.CreateScope();
                     var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
                     await repo.InsertMachineOracle();
+
+                    // Devuelve a Envio=0 las filas reservadas hace más de _claimTimeoutMinutes
+                    // sin resolver — nunca toca Envio=4 (Oracle ya confirmó, es intocable).
+                    // Va antes del Populate del ciclo para que lo recién liberado pueda
+                    // reclamarse en el mismo ciclo, no en el siguiente.
+                    var reclaimedIni = await repo.ReclaimOrphanedIniLLamada(_claimTimeoutMinutes);
+                    if (reclaimedIni > 0)
+                        _logger.LogWarning("{Count} interacciones IniLLamada reclamadas por timeout (más de {TimeoutMin}min en Envio=2)", reclaimedIni, _claimTimeoutMinutes);
+                    var reclaimedFin = await repo.ReclaimOrphanedFinLLamada(_claimTimeoutMinutes);
+                    if (reclaimedFin > 0)
+                        _logger.LogWarning("{Count} interacciones FinLLamada reclamadas por timeout (más de {TimeoutMin}min en Envio=2)", reclaimedFin, _claimTimeoutMinutes);
+
                     var iniRecords = await repo.PopulateIniLLamada(_batchSize);
                     if (iniRecords.Any())
                     {
@@ -378,15 +397,24 @@ namespace PacificoSeguros.Process.Services
             {
                 // UpdateIniLLamada ya agotó su propia política de reintento + circuit
                 // breaker (PersistConfirmedResultPolicy) antes de llegar acá. Si el outcome
-                // era Success, Oracle ya creó la gestión — esta fila queda en Envio=2 sin
-                // ningún otro rastro de eso en la base, porque justamente esta UPDATE es la
-                // que iba a grabar IdOracle/UrlOracle y fue la que falló. Por eso el log
-                // explícito acá: es la única forma de que quede escrito que no hay que
-                // reenviar, solo corregir el dato a mano.
+                // era Success, Oracle ya creó la gestión — esta fila, si se queda en Envio=2,
+                // es indistinguible de un huérfano que nunca tocó a Oracle, y el timeout de
+                // reclamo la reenviaría creando una gestión duplicada. Por eso el intento
+                // final: marcarla en Envio=4, un estado que el reclamo por timeout nunca
+                // toca. Si ni ese UPDATE liviano logra entrar, al menos queda el log
+                // explícito con el IdOracle para el triage manual.
                 if (outcome == ApiOutcome.Success)
-                    _logger.LogError(ex, "No se pudo persistir el éxito de {LI} — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). No reenviar: requiere corrección manual (UPDATE Envio=1, IdOracle, UrlOracle) en GSS_OraclePacifico, la fila queda en Envio=2.", record.LastInteractionId, idOracle, urlOracle);
+                {
+                    var marked = await repo.MarkIniLLamadaConfirmedUnpersisted(record.LastInteractionId!);
+                    if (marked)
+                        _logger.LogError(ex, "No se pudo persistir el éxito de {LI} — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). Marcada en Envio=4, no se reintentará sola: requiere corrección manual (UPDATE Envio=1, IdOracle, UrlOracle) en GSS_OraclePacifico.", record.LastInteractionId, idOracle, urlOracle);
+                    else
+                        _logger.LogError(ex, "No se pudo persistir el éxito de {LI} ni marcarla en Envio=4 — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). La fila queda en Envio=2: el reclamo por timeout la va a reenviar si no se corrige a mano antes.", record.LastInteractionId, idOracle, urlOracle);
+                }
                 else
-                    _logger.LogError(ex, "No se pudo persistir el resultado (PermanentFailure) de {LI} — la fila queda en Envio=2 para revisión manual.", record.LastInteractionId);
+                {
+                    _logger.LogError(ex, "No se pudo persistir el resultado (PermanentFailure) de {LI} — la fila queda en Envio=2, elegible para reclamo por timeout.", record.LastInteractionId);
+                }
             }
 
             return outcome;
@@ -417,9 +445,17 @@ namespace PacificoSeguros.Process.Services
                 // PersistConfirmedResultPolicy. record.IdOracle ya viene seteado del paso
                 // Ini previo, es el identificador que ata esta fila a la gestión en Oracle.
                 if (outcome == ApiOutcome.Success)
-                    _logger.LogError(ex, "No se pudo persistir el éxito de FinalizarGestion en {LI} — Oracle ya procesó esta finalización (IdOracle={IdOracle}). No reenviar: requiere corrección manual (UPDATE EnvioFinLLamada=1) en GSS_OraclePacifico, la fila queda en Envio=2.", record.LastInteractionId, record.IdOracle);
+                {
+                    var marked = await repo.MarkFinLLamadaConfirmedUnpersisted(record.LastInteractionId!);
+                    if (marked)
+                        _logger.LogError(ex, "No se pudo persistir el éxito de FinalizarGestion en {LI} — Oracle ya procesó esta finalización (IdOracle={IdOracle}). Marcada en Envio=4, no se reintentará sola: requiere corrección manual (UPDATE EnvioFinLLamada=1) en GSS_OraclePacifico.", record.LastInteractionId, record.IdOracle);
+                    else
+                        _logger.LogError(ex, "No se pudo persistir el éxito de FinalizarGestion en {LI} ni marcarla en Envio=4 — Oracle ya procesó esta finalización (IdOracle={IdOracle}). La fila queda en Envio=2: el reclamo por timeout la va a reenviar si no se corrige a mano antes.", record.LastInteractionId, record.IdOracle);
+                }
                 else
-                    _logger.LogError(ex, "No se pudo persistir el resultado (PermanentFailure) de FinalizarGestion en {LI} — la fila queda en Envio=2 para revisión manual.", record.LastInteractionId);
+                {
+                    _logger.LogError(ex, "No se pudo persistir el resultado (PermanentFailure) de FinalizarGestion en {LI} — la fila queda en Envio=2, elegible para reclamo por timeout.", record.LastInteractionId);
+                }
             }
 
             return outcome;

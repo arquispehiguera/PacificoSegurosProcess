@@ -10,6 +10,10 @@ namespace PacificoSeguros.Core.Interfaces
         Task<bool> UpdateFinLLamada(string jsonFin, string jsonRespuestaFin, int envioFinLLamada, string lastInteractionId);
         Task<bool> ReleaseIniLLamadaClaim(string lastInteractionId);
         Task<bool> ReleaseFinLLamadaClaim(string lastInteractionId);
+        Task<bool> MarkIniLLamadaConfirmedUnpersisted(string lastInteractionId);
+        Task<bool> MarkFinLLamadaConfirmedUnpersisted(string lastInteractionId);
+        Task<int> ReclaimOrphanedIniLLamada(int timeoutMinutes);
+        Task<int> ReclaimOrphanedFinLLamada(int timeoutMinutes);
         Task InsertMachineOracle();
     }
 }

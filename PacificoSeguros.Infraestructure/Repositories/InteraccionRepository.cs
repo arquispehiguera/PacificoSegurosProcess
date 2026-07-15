@@ -53,7 +53,7 @@ namespace PacificoSeguros.Infraestructure.Repositories
             // intente de nuevo — sin reintento automático ciego acá.
             const string claimSql = @"
                 UPDATE TOP (@Top) GSS_OraclePacifico WITH(ROWLOCK, READPAST)
-                SET EnvioIniLLamada = 2
+                SET EnvioIniLLamada = 2, FechaReserva = GETDATE()
                 OUTPUT INSERTED.LastInteractionId
                 WHERE EnvioIniLLamada = 0
                     AND FechaIniLLamada >= CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE)
@@ -93,7 +93,7 @@ namespace PacificoSeguros.Infraestructure.Repositories
             // envolver esto en DbRetry que PopulateIniLLamada — ver comentarios ahí.
             const string claimSql = @"
                 UPDATE TOP (@Top) GSS_OraclePacifico WITH(ROWLOCK, READPAST)
-                SET EnvioFinLLamada = 2
+                SET EnvioFinLLamada = 2, FechaReserva = GETDATE()
                 OUTPUT INSERTED.LastInteractionId
                 WHERE EnvioFinLLamada = 0
                     AND EnvioIniLLamada = 1
@@ -268,6 +268,114 @@ namespace PacificoSeguros.Infraestructure.Repositories
             catch (Exception ex)
             {
                 _logger.LogError(ex, "ReleaseFinLLamadaClaim falló después de 2 reintentos para {LastInteractionId}", lastInteractionId);
+                throw;
+            }
+        }
+
+        public async Task<bool> MarkIniLLamadaConfirmedUnpersisted(string lastInteractionId)
+        {
+            // Último recurso cuando UpdateIniLLamada ya agotó PersistConfirmedResultPolicy
+            // — incluido su circuit breaker, que a esta altura probablemente está abierto.
+            // Por eso esto usa DbRetry liviano en vez de la misma política: si se reusara
+            // PersistConfirmedResultPolicy, este intento fallaría instantáneo por el
+            // circuito ya abierto de la operación pesada, sin ni siquiera probar. Un UPDATE
+            // de una sola columna tiene más chance de entrar que el UPDATE completo que
+            // acaba de fallar. Si aun así falla, la fila queda en Envio=2 sin distinguir del
+            // huérfano genérico — caso raro dentro de un caso raro, aceptado.
+            const string sql = @"
+                UPDATE GSS_OraclePacifico
+                SET EnvioIniLLamada = 4
+                WHERE LastInteractionId = @LastInteractionId AND EnvioIniLLamada = 2";
+
+            try
+            {
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<bool>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    return await connection.ExecuteAsync(sql, new { LastInteractionId = lastInteractionId }) > 0;
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "MarkIniLLamadaConfirmedUnpersisted falló para {LastInteractionId} — la fila queda en Envio=2 sin distinguir del huérfano genérico", lastInteractionId);
+                return false;
+            }
+        }
+
+        public async Task<bool> MarkFinLLamadaConfirmedUnpersisted(string lastInteractionId)
+        {
+            const string sql = @"
+                UPDATE GSS_OraclePacifico
+                SET EnvioFinLLamada = 4
+                WHERE LastInteractionId = @LastInteractionId AND EnvioFinLLamada = 2";
+
+            try
+            {
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<bool>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    return await connection.ExecuteAsync(sql, new { LastInteractionId = lastInteractionId }) > 0;
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "MarkFinLLamadaConfirmedUnpersisted falló para {LastInteractionId} — la fila queda en Envio=2 sin distinguir del huérfano genérico", lastInteractionId);
+                return false;
+            }
+        }
+
+        public async Task<int> ReclaimOrphanedIniLLamada(int timeoutMinutes)
+        {
+            // Filas en Envio=2 son, por construcción, las que nunca llegaron a un resultado
+            // confirmado de Oracle — el caso confirmado-pero-no-persistido escribe Envio=4,
+            // no 2 (ver MarkIniLLamadaConfirmedUnpersisted). Por eso acá es seguro devolver
+            // a 0 sin más preguntas: nunca puede tratarse de una gestión que Oracle ya creó.
+            const string sql = @"
+                UPDATE GSS_OraclePacifico
+                SET EnvioIniLLamada = 0
+                WHERE EnvioIniLLamada = 2
+                    AND FechaReserva IS NOT NULL
+                    AND FechaReserva < DATEADD(MINUTE, -@TimeoutMinutes, GETDATE())";
+
+            try
+            {
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<int>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    return await connection.ExecuteAsync(sql, new { TimeoutMinutes = timeoutMinutes });
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ReclaimOrphanedIniLLamada falló después de 2 reintentos");
+                throw;
+            }
+        }
+
+        public async Task<int> ReclaimOrphanedFinLLamada(int timeoutMinutes)
+        {
+            const string sql = @"
+                UPDATE GSS_OraclePacifico
+                SET EnvioFinLLamada = 0
+                WHERE EnvioFinLLamada = 2
+                    AND FechaReserva IS NOT NULL
+                    AND FechaReserva < DATEADD(MINUTE, -@TimeoutMinutes, GETDATE())";
+
+            try
+            {
+                return await ResiliencePolicies.DbRetry.ExecuteAsync<int>(async () =>
+                {
+                    using var connection = _context.CreateConnection();
+                    connection.Open();
+                    return await connection.ExecuteAsync(sql, new { TimeoutMinutes = timeoutMinutes });
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ReclaimOrphanedFinLLamada falló después de 2 reintentos");
                 throw;
             }
         }

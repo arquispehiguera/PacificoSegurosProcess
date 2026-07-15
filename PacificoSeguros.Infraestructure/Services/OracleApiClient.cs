@@ -253,9 +253,6 @@ namespace PacificoSeguros.Infraestructure.Services
             }
         }
 
-        public string BuildFinLlamadaUrl(long id) =>
-            $"{_configuration["OracleApi:BaseUrl"]}{_configuration["OracleApi:FinLlamadaPath"]}/{id}";
-
         private static bool IsTransient(HttpStatusCode status) =>
             status == HttpStatusCode.TooManyRequests ||
             status == HttpStatusCode.InternalServerError ||
