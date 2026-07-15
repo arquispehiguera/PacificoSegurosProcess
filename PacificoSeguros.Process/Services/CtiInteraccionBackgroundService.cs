@@ -25,6 +25,7 @@ namespace PacificoSeguros.Process.Services
 
         private readonly int _pollingIntervalSeconds;
         private readonly int _maxConcurrentWorkers;
+        private readonly int _batchSize;
 
         public CtiInteraccionBackgroundService(
             ILogger<CtiInteraccionBackgroundService> logger,
@@ -42,6 +43,11 @@ namespace PacificoSeguros.Process.Services
             _consumersHeartbeat = consumersHeartbeat;
             _pollingIntervalSeconds = configuration.GetValue<int>("OracleApi:PollingIntervalSeconds", 10);
             _maxConcurrentWorkers = configuration.GetValue<int>("OracleApi:MaxConcurrentWorkers", 5);
+            // Tamaño de tanda por poll — acota cuántas filas quedan reservadas (Envio = 2)
+            // en RAM a la vez. No define el throughput real contra Oracle: eso lo hace el
+            // rate limiter de OracleApiClient (100/min), que aplica sin importar cuánto
+            // traiga acá. Este valor solo evita reservar de más entre un poll y el siguiente.
+            _batchSize = configuration.GetValue<int>("OracleApi:BatchSize", 20);
 
             _iniChannel = Channel.CreateUnbounded<CtiInteraccion>(new UnboundedChannelOptions { SingleWriter = true });
             _finChannel = Channel.CreateUnbounded<CtiInteraccion>(new UnboundedChannelOptions { SingleWriter = true });
@@ -76,7 +82,7 @@ namespace PacificoSeguros.Process.Services
                     using var scope = _serviceProvider.CreateScope();
                     var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
                     await repo.InsertMachineOracle();
-                    var iniRecords = await repo.PopulateIniLLamada();
+                    var iniRecords = await repo.PopulateIniLLamada(_batchSize);
                     _logger.LogInformation("[DEBUG] {Count} registros IniLLamada encontrados", iniRecords.Count);
                     foreach (var record in iniRecords)
                     {
@@ -87,12 +93,25 @@ namespace PacificoSeguros.Process.Services
                         using (LogContext.PushProperty("Celular", MaskCelular(record.Celular)))
                         using (LogContext.PushProperty("ContactId", record.LastInteractionId))
                         {
-                            _logger.LogInformation("[DEBUG] Procesando IniLLamada: {LI}", record.LastInteractionId);
-                            _ = await ProcessIniLlamada(repo, record);
+                            // Try/catch por registro: iniRecords ya salió de un UPDATE de
+                            // claim (Envio=2 para todo el lote). Si un registro revienta acá
+                            // y no hay try/catch propio, el catch del ciclo completo aborta
+                            // el foreach y el resto del lote ya reservado queda huérfano en
+                            // Envio=2 sin necesidad — un solo registro problemático no debería
+                            // abandonar a los demás que ya están listos para procesarse.
+                            try
+                            {
+                                _logger.LogInformation("[DEBUG] Procesando IniLLamada: {LI}", record.LastInteractionId);
+                                _ = await ProcessIniLlamada(repo, record, ct);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "[DEBUG] Error procesando IniLLamada {LI}", record.LastInteractionId);
+                            }
                         }
                     }
 
-                    var finRecords = await repo.PopulateFinLLamada();
+                    var finRecords = await repo.PopulateFinLLamada(_batchSize);
                     _logger.LogInformation("[DEBUG] {Count} registros FinLLamada encontrados", finRecords.Count);
                     foreach (var record in finRecords)
                     {
@@ -103,8 +122,15 @@ namespace PacificoSeguros.Process.Services
                         using (LogContext.PushProperty("Celular", MaskCelular(record.Celular)))
                         using (LogContext.PushProperty("ContactId", record.LastInteractionId))
                         {
-                            _logger.LogInformation("[DEBUG] Procesando FinLLamada: {LI}", record.LastInteractionId);
-                            _ = await ProcessFinLlamada(repo, record);
+                            try
+                            {
+                                _logger.LogInformation("[DEBUG] Procesando FinLLamada: {LI}", record.LastInteractionId);
+                                _ = await ProcessFinLlamada(repo, record, ct);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "[DEBUG] Error procesando FinLLamada {LI}", record.LastInteractionId);
+                            }
                         }
                     }
 
@@ -133,14 +159,14 @@ namespace PacificoSeguros.Process.Services
                     using var scope = _serviceProvider.CreateScope();
                     var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
                     await repo.InsertMachineOracle();
-                    var iniRecords = await repo.PopulateIniLLamada();
+                    var iniRecords = await repo.PopulateIniLLamada(_batchSize);
                     if (iniRecords.Any())
                     {
                         _logger.LogInformation("{Count} interacciones IniLLamada pendientes", iniRecords.Count);
                         foreach (var r in iniRecords)
                             await _iniChannel.Writer.WriteAsync(r, ct);
                     }
-                    var finRecords = await repo.PopulateFinLLamada();
+                    var finRecords = await repo.PopulateFinLLamada(_batchSize);
                     if (finRecords.Any())
                     {
                         _logger.LogInformation("{Count} interacciones FinLLamada pendientes", finRecords.Count);
@@ -212,7 +238,7 @@ namespace PacificoSeguros.Process.Services
                         {
                             using var scope = _serviceProvider.CreateScope();
                             var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
-                            var outcome = await ProcessIniLlamada(repo, record);
+                            var outcome = await ProcessIniLlamada(repo, record, ct);
                             if (outcome == ApiOutcome.TransientFailure)
                             {
                                 _logger.LogDebug("Worker-Ini #{Id}: falla transitoria en {LI}, se reintentará en el próximo ciclo", workerId, record.LastInteractionId);
@@ -283,7 +309,7 @@ namespace PacificoSeguros.Process.Services
                         {
                             using var scope = _serviceProvider.CreateScope();
                             var repo = scope.ServiceProvider.GetRequiredService<IInteraccionRepository>();
-                            var outcome = await ProcessFinLlamada(repo, record);
+                            var outcome = await ProcessFinLlamada(repo, record, ct);
                             if (outcome == ApiOutcome.TransientFailure)
                             {
                                 _logger.LogDebug("Worker-Fin #{Id}: falla transitoria en {LI}, se reintentará en el próximo ciclo", workerId, record.LastInteractionId);
@@ -309,7 +335,7 @@ namespace PacificoSeguros.Process.Services
             }
         }
 
-        private async Task<ApiOutcome> ProcessIniLlamada(IInteraccionRepository repo, CtiInteraccion record)
+        private async Task<ApiOutcome> ProcessIniLlamada(IInteraccionRepository repo, CtiInteraccion record, CancellationToken ct)
         {
             var request = new OracleIniLlamadaRequest
             {
@@ -322,41 +348,101 @@ namespace PacificoSeguros.Process.Services
                 tUsuarioNumDoc_c = record.AgenteId
             };
 
-            var (outcome, response) = await _oracleClient.IniciarGestionAsync(request);
+            var (outcome, response) = await _oracleClient.IniciarGestionAsync(request, ct);
 
             if (outcome == ApiOutcome.TransientFailure)
-                return outcome; // no se toca la fila, sigue en Envio=0 para el próximo ciclo
+            {
+                // La fila quedó reservada (Envio=2) por el claim del Populate — hay que
+                // devolverla a 0 explícitamente para que el próximo ciclo la vuelva a
+                // tomar. Distinto del huérfano por crash/shutdown: acá el proceso sigue
+                // vivo y sabe que este intento no llegó a destino.
+                await TryReleaseClaim(() => repo.ReleaseIniLLamadaClaim(record.LastInteractionId!), record.LastInteractionId!);
+                return outcome;
+            }
 
             int envio = outcome == ApiOutcome.Success && response?.Id > 0 ? 1 : 3;
             long idOracle = response?.Id ?? 0;
             string urlOracle = response?.tURL_c ?? "";
 
-            await repo.UpdateIniLLamada(
-                JsonConvert.SerializeObject(request),
-                JsonConvert.SerializeObject(response),
-                envio,
-                record.LastInteractionId!,
-                idOracle,
-                urlOracle);
+            try
+            {
+                await repo.UpdateIniLLamada(
+                    JsonConvert.SerializeObject(request),
+                    JsonConvert.SerializeObject(response),
+                    envio,
+                    record.LastInteractionId!,
+                    idOracle,
+                    urlOracle);
+            }
+            catch (Exception ex)
+            {
+                // UpdateIniLLamada ya agotó su propia política de reintento + circuit
+                // breaker (PersistConfirmedResultPolicy) antes de llegar acá. Si el outcome
+                // era Success, Oracle ya creó la gestión — esta fila queda en Envio=2 sin
+                // ningún otro rastro de eso en la base, porque justamente esta UPDATE es la
+                // que iba a grabar IdOracle/UrlOracle y fue la que falló. Por eso el log
+                // explícito acá: es la única forma de que quede escrito que no hay que
+                // reenviar, solo corregir el dato a mano.
+                if (outcome == ApiOutcome.Success)
+                    _logger.LogError(ex, "No se pudo persistir el éxito de {LI} — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). No reenviar: requiere corrección manual (UPDATE Envio=1, IdOracle, UrlOracle) en GSS_OraclePacifico, la fila queda en Envio=2.", record.LastInteractionId, idOracle, urlOracle);
+                else
+                    _logger.LogError(ex, "No se pudo persistir el resultado (PermanentFailure) de {LI} — la fila queda en Envio=2 para revisión manual.", record.LastInteractionId);
+            }
 
             return outcome;
         }
 
-        private async Task<ApiOutcome> ProcessFinLlamada(IInteraccionRepository repo, CtiInteraccion record)
+        private async Task<ApiOutcome> ProcessFinLlamada(IInteraccionRepository repo, CtiInteraccion record, CancellationToken ct)
         {
             var request = new OracleFinLlamadaRequest { dFin_c = FormatFecha(record.FechaFinLLamada) };
-            var (outcome, responseBody) = await _oracleClient.FinalizarGestionAsync(request, record.IdOracle ?? 0L);
+            var (outcome, responseBody) = await _oracleClient.FinalizarGestionAsync(request, record.IdOracle ?? 0L, ct);
 
             if (outcome == ApiOutcome.TransientFailure)
+            {
+                await TryReleaseClaim(() => repo.ReleaseFinLLamadaClaim(record.LastInteractionId!), record.LastInteractionId!);
                 return outcome;
+            }
 
-            await repo.UpdateFinLLamada(
-                JsonConvert.SerializeObject(request),
-                responseBody ?? string.Empty,
-                outcome == ApiOutcome.Success ? 1 : 3,
-                record.LastInteractionId!);
+            try
+            {
+                await repo.UpdateFinLLamada(
+                    JsonConvert.SerializeObject(request),
+                    responseBody ?? string.Empty,
+                    outcome == ApiOutcome.Success ? 1 : 3,
+                    record.LastInteractionId!);
+            }
+            catch (Exception ex)
+            {
+                // Mismo motivo que en ProcessIniLlamada — UpdateFinLLamada ya agotó
+                // PersistConfirmedResultPolicy. record.IdOracle ya viene seteado del paso
+                // Ini previo, es el identificador que ata esta fila a la gestión en Oracle.
+                if (outcome == ApiOutcome.Success)
+                    _logger.LogError(ex, "No se pudo persistir el éxito de FinalizarGestion en {LI} — Oracle ya procesó esta finalización (IdOracle={IdOracle}). No reenviar: requiere corrección manual (UPDATE EnvioFinLLamada=1) en GSS_OraclePacifico, la fila queda en Envio=2.", record.LastInteractionId, record.IdOracle);
+                else
+                    _logger.LogError(ex, "No se pudo persistir el resultado (PermanentFailure) de FinalizarGestion en {LI} — la fila queda en Envio=2 para revisión manual.", record.LastInteractionId);
+            }
 
             return outcome;
+        }
+
+        // Libera el claim (Envio 2->0) tras un TransientFailure. Atrapa la excepción acá
+        // en vez de dejarla escapar al catch genérico del worker: si la liberación misma
+        // falla (ej. un lock transitorio en la base justo en ese instante), la fila queda
+        // en Envio=2 igual — pero con este log específico se puede distinguir del huérfano
+        // por crash/shutdown que el cliente aceptó como caso válido. También avisa si la
+        // UPDATE no afectó ninguna fila (el claim ya no estaba en Envio=2 por otra razón).
+        private async Task TryReleaseClaim(Func<Task<bool>> release, string lastInteractionId)
+        {
+            try
+            {
+                var released = await release();
+                if (!released)
+                    _logger.LogWarning("Release de claim en {LI} no afectó ninguna fila — el claim ya no estaba en Envio=2", lastInteractionId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "No se pudo liberar el claim de {LI} tras un TransientFailure — la fila puede quedar en Envio=2 por esta falla, no por un crash/shutdown", lastInteractionId);
+            }
         }
 
         private static string FormatFecha(DateTime? fecha) =>
