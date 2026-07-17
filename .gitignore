@@ -24,6 +24,13 @@ appsettings.*.json
 # Local MCP config
 .mcp.json
 
+# Logs
+*.log
+*.txt
+
+# Publish profiles (local machine config)
+PublishProfiles/
+
 # ATL / agent internals
 .atl/
 
