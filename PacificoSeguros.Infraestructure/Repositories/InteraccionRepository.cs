@@ -1,9 +1,11 @@
 using Dapper;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using PacificoSeguros.Core.Entities;
 using PacificoSeguros.Core.Interfaces;
 using PacificoSeguros.Infraestructure.Data;
 using System.Data;
+using System.Globalization;
 
 namespace PacificoSeguros.Infraestructure.Repositories
 {
@@ -11,11 +13,31 @@ namespace PacificoSeguros.Infraestructure.Repositories
     {
         private readonly DbContextApp _context;
         private readonly ILogger<InteraccionRepository> _logger;
+        private readonly IConfiguration _configuration;
 
-        public InteraccionRepository(DbContextApp context, ILogger<InteraccionRepository> logger)
+        public InteraccionRepository(DbContextApp context, ILogger<InteraccionRepository> logger, IConfiguration configuration)
         {
             _context = context;
             _logger = logger;
+            _configuration = configuration;
+        }
+
+        // OracleApi:ReprocessDate ("yyyy-MM-dd") pisa el filtro de "hoy" en los dos
+        // Populate — pensado para reprocesar un día puntual a mano. Vacío/ausente (caso
+        // normal) devuelve null y el SQL cae al mismo GETDATE()-5h de siempre vía COALESCE.
+        private DateTime? GetReprocessDate()
+        {
+            var raw = _configuration["OracleApi:ReprocessDate"];
+            if (string.IsNullOrWhiteSpace(raw))
+                return null;
+
+            if (!DateTime.TryParseExact(raw, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
+            {
+                _logger.LogWarning("OracleApi:ReprocessDate ({Raw}) no tiene formato yyyy-MM-dd — se ignora, se usa el día de hoy", raw);
+                return null;
+            }
+
+            return date;
         }
 
         public async Task<IReadOnlyList<CtiInteraccion>> PopulateIniLLamada(int top)
@@ -52,19 +74,20 @@ namespace PacificoSeguros.Infraestructure.Repositories
             // excepción suba (el catch de más abajo la loguea) y que el próximo poll lo
             // intente de nuevo — sin reintento automático ciego acá.
             const string claimSql = @"
+                DECLARE @TargetDate DATE = COALESCE(@ReprocessDate, CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE));
                 UPDATE TOP (@Top) GSS_OraclePacifico WITH(ROWLOCK, READPAST)
                 SET EnvioIniLLamada = 2, FechaReserva = GETDATE()
                 OUTPUT INSERTED.LastInteractionId
                 WHERE EnvioIniLLamada = 0
-                    AND FechaIniLLamada >= CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE)
-                    AND FechaIniLLamada <  DATEADD(DAY, 1, CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE))";
+                    AND FechaIniLLamada >= @TargetDate
+                    AND FechaIniLLamada <  DATEADD(DAY, 1, @TargetDate)";
 
             List<string> claimedIds;
             try
             {
                 using var connection = _context.CreateConnection();
                 connection.Open();
-                var result = await connection.QueryAsync<string>(claimSql, new { Top = top }, commandType: CommandType.Text);
+                var result = await connection.QueryAsync<string>(claimSql, new { Top = top, ReprocessDate = GetReprocessDate() }, commandType: CommandType.Text);
                 claimedIds = result.ToList();
             }
             catch (Exception ex)
@@ -92,21 +115,22 @@ namespace PacificoSeguros.Infraestructure.Repositories
             // Mismo ajuste de reloj, mismo claim en dos pasos y mismo motivo para no
             // envolver esto en DbRetry que PopulateIniLLamada — ver comentarios ahí.
             const string claimSql = @"
+                DECLARE @TargetDate DATE = COALESCE(@ReprocessDate, CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE));
                 UPDATE TOP (@Top) GSS_OraclePacifico WITH(ROWLOCK, READPAST)
                 SET EnvioFinLLamada = 2, FechaReserva = GETDATE()
                 OUTPUT INSERTED.LastInteractionId
                 WHERE EnvioFinLLamada = 0
                     AND EnvioIniLLamada = 1
                     AND FechaFinLLamada IS NOT NULL
-                    AND FechaIniLLamada >= CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE)
-                    AND FechaIniLLamada <  DATEADD(DAY, 1, CAST(DATEADD(HOUR, -5, GETDATE()) AS DATE))";
+                    AND FechaIniLLamada >= @TargetDate
+                    AND FechaIniLLamada <  DATEADD(DAY, 1, @TargetDate)";
 
             List<string> claimedIds;
             try
             {
                 using var connection = _context.CreateConnection();
                 connection.Open();
-                var result = await connection.QueryAsync<string>(claimSql, new { Top = top }, commandType: CommandType.Text);
+                var result = await connection.QueryAsync<string>(claimSql, new { Top = top, ReprocessDate = GetReprocessDate() }, commandType: CommandType.Text);
                 claimedIds = result.ToList();
             }
             catch (Exception ex)
@@ -140,7 +164,7 @@ namespace PacificoSeguros.Infraestructure.Repositories
                 SELECT LastInteractionId, Celular, Proveedor, FechaIniLLamada,
                        Tipo, AgenteId, JsonIni, RespuestaIni, IdOracle, UrlOracle,
                        EnvioIniLLamada, FechaFinLLamada, JsonFin, RespuestaFin,
-                       EnvioFinLLamada, FechaRegistro, IdOportunidad
+                       EnvioFinLLamada, FechaRegistro, IdOportunidad, Resultado, Motivo
                 FROM GSS_OraclePacifico WITH(NOLOCK)
                 WHERE LastInteractionId IN @Ids";
 

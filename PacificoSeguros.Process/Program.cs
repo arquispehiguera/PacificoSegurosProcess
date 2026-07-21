@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -81,7 +82,8 @@ namespace PacificoSeguros.Process
                     services.ConfigureHttpClientDefaults(builder =>
                         builder.ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
                         {
-                            PooledConnectionLifetime = TimeSpan.FromMinutes(5)
+                            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                            AutomaticDecompression = DecompressionMethods.All
                         }));
                     services.AddTransient<IInteraccionRepository, InteraccionRepository>();
                     services.AddSingleton<IOracleApiClient, OracleApiClient>();

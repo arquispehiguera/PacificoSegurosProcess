@@ -364,7 +364,9 @@ namespace PacificoSeguros.Process.Services
                 tUCID_c = record.LastInteractionId,
                 chTipo_c = record.Tipo,
                 chOpty_Id_c = record.IdOportunidad,
-                tUsuarioNumDoc_c = record.AgenteId
+                tUsuarioNumDoc_c = record.AgenteId,
+                chOptyTipifResultado_c = record.Resultado,
+                chOptyTipifSubResultado_c = record.Motivo
             };
 
             var (outcome, response) = await _oracleClient.IniciarGestionAsync(request, ct);
@@ -422,7 +424,12 @@ namespace PacificoSeguros.Process.Services
 
         private async Task<ApiOutcome> ProcessFinLlamada(IInteraccionRepository repo, CtiInteraccion record, CancellationToken ct)
         {
-            var request = new OracleFinLlamadaRequest { dFin_c = FormatFecha(record.FechaFinLLamada) };
+            var request = new OracleFinLlamadaRequest
+            {
+                dFin_c = FormatFecha(record.FechaFinLLamada),
+                chOptyTipifResultado_c = record.Resultado,
+                chOptyTipifSubResultado_c = record.Motivo
+            };
             var (outcome, responseBody) = await _oracleClient.FinalizarGestionAsync(request, record.IdOracle ?? 0L, ct);
 
             if (outcome == ApiOutcome.TransientFailure)

@@ -54,7 +54,10 @@ namespace PacificoSeguros.Infraestructure.Services
         {
             var url = $"{_configuration["OracleApi:BaseUrl"]}{_configuration["OracleApi:IniLlamadaPath"]}";
             var subscriptionKey = _configuration["OracleApi:SubscriptionKey"]!;
-            var jsonBody = JsonConvert.SerializeObject(request);
+            // NullValueHandling.Ignore: chOptyTipifResultado_c/chOptyTipifSubResultado_c van en null
+            // para AGENT (recién se conocen al cerrar la llamada, en FinLlamada) — sin esto,
+            // Newtonsoft los manda igual como "prop": null en vez de omitirlos del JSON.
+            var jsonBody = JsonConvert.SerializeObject(request, new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
 
             try
             {
