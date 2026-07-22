@@ -356,6 +356,8 @@ namespace PacificoSeguros.Process.Services
 
         private async Task<ApiOutcome> ProcessIniLlamada(IInteraccionRepository repo, CtiInteraccion record, CancellationToken ct)
         {
+            bool isMachine = string.Equals(record.Origen?.Trim(), "MACHINE", StringComparison.OrdinalIgnoreCase);
+
             var request = new OracleIniLlamadaRequest
             {
                 tANI_c = record.Celular,
@@ -368,6 +370,11 @@ namespace PacificoSeguros.Process.Services
                 chOptyTipifResultado_c = record.Resultado,
                 chOptyTipifSubResultado_c = record.Motivo
             };
+            // MACHINE es un evento atómico (IVR/self-service): no hay una fecha de fin
+            // real distinta de la de inicio, por eso se refleja dInicio_c en vez de
+            // depender de FechaFinLLamada (que en la práctica llega null).
+            if (isMachine)
+                request.dFin_c = request.dInicio_c;
 
             var (outcome, response) = await _oracleClient.IniciarGestionAsync(request, ct);
 
@@ -393,7 +400,8 @@ namespace PacificoSeguros.Process.Services
                     envio,
                     record.LastInteractionId!,
                     idOracle,
-                    urlOracle);
+                    urlOracle,
+                    envioFinLLamada: (isMachine && envio == 1) ? 1 : (int?)null);
             }
             catch (Exception ex)
             {
@@ -409,7 +417,13 @@ namespace PacificoSeguros.Process.Services
                 {
                     var marked = await repo.MarkIniLLamadaConfirmedUnpersisted(record.LastInteractionId!);
                     if (marked)
-                        _logger.LogError(ex, "No se pudo persistir el éxito de {LI} — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). Marcada en Envio=4, no se reintentará sola: requiere corrección manual (UPDATE Envio=1, IdOracle, UrlOracle) en GSS_OraclePacifico.", record.LastInteractionId, idOracle, urlOracle);
+                    {
+                        // Para MACHINE hay que cerrar también EnvioFinLLamada=1 en la corrección
+                        // manual — si no, la fila queda expuesta a un PATCH FinalizarGestion
+                        // indebido en el próximo poll (ver WHERE de PopulateFinLLamada).
+                        var recoveryHint = isMachine ? "Envio=1, EnvioFinLLamada=1, IdOracle, UrlOracle" : "Envio=1, IdOracle, UrlOracle";
+                        _logger.LogError(ex, "No se pudo persistir el éxito de {LI} — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). Marcada en Envio=4, no se reintentará sola: requiere corrección manual (UPDATE {RecoveryHint}) en GSS_OraclePacifico.", record.LastInteractionId, idOracle, urlOracle, recoveryHint);
+                    }
                     else
                         _logger.LogError(ex, "No se pudo persistir el éxito de {LI} ni marcarla en Envio=4 — Oracle ya procesó esta interacción (IdOracle={IdOracle}, UrlOracle={UrlOracle}). La fila queda en Envio=2: el reclamo por timeout la va a reenviar si no se corrige a mano antes.", record.LastInteractionId, idOracle, urlOracle);
                 }

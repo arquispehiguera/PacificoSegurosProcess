@@ -5,6 +5,7 @@ namespace PacificoSeguros.Core.Entities
         public string LastInteractionId { get; set; } = string.Empty;
         public string? Celular { get; set; }
         public string Proveedor { get; set; } = "COVISIAN";
+        public string? Origen { get; set; }
         public DateTime? FechaIniLLamada { get; set; }
         public string Tipo { get; set; } = "EC";
         public string? AgenteId { get; set; }
@@ -16,6 +17,8 @@ namespace PacificoSeguros.Core.Entities
         public DateTime? FechaFinLLamada { get; set; }
         public string? JsonFin { get; set; }
         public string? RespuestaFin { get; set; }
+        // Para Origen=MACHINE, 1 significa "canal cerrado sin PATCH real" (JsonFin/RespuestaFin
+        // quedan null) — no confundir con AGENT, donde 1 sí implica que Oracle confirmó el PATCH.
         public int EnvioFinLLamada { get; set; } = 0;
         public string? Resultado { get; set; }
         public string? Motivo { get; set; }

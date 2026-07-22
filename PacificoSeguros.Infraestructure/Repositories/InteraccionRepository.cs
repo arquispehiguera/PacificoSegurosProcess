@@ -122,6 +122,9 @@ namespace PacificoSeguros.Infraestructure.Repositories
                 WHERE EnvioFinLLamada = 0
                     AND EnvioIniLLamada = 1
                     AND FechaFinLLamada IS NOT NULL
+                    -- Origen=MACHINE nunca pasa por FinalizarGestion, sin importar el estado
+                    -- de EnvioFinLLamada (cubre también residuos históricos previos a este filtro).
+                    AND Origen <> 'MACHINE'
                     AND FechaIniLLamada >= @TargetDate
                     AND FechaIniLLamada <  DATEADD(DAY, 1, @TargetDate)";
 
@@ -161,7 +164,7 @@ namespace PacificoSeguros.Infraestructure.Repositories
                 return Array.Empty<CtiInteraccion>();
 
             const string sql = @"
-                SELECT LastInteractionId, Celular, Proveedor, FechaIniLLamada,
+                SELECT LastInteractionId, Celular, Proveedor, Origen, FechaIniLLamada,
                        Tipo, AgenteId, JsonIni, RespuestaIni, IdOracle, UrlOracle,
                        EnvioIniLLamada, FechaFinLLamada, JsonFin, RespuestaFin,
                        EnvioFinLLamada, FechaRegistro, IdOportunidad, Resultado, Motivo
@@ -174,15 +177,19 @@ namespace PacificoSeguros.Infraestructure.Repositories
             return result.ToList();
         }
 
-        public async Task<bool> UpdateIniLLamada(string jsonIni, string jsonRespuestaIni, int envioIniLLamada, string lastInteractionId, long idOracle, string urlOracle)
+        public async Task<bool> UpdateIniLLamada(string jsonIni, string jsonRespuestaIni, int envioIniLLamada, string lastInteractionId, long idOracle, string urlOracle, int? envioFinLLamada = null)
         {
+            // envioFinLLamada solo llega no-null para Origen=MACHINE exitoso: cierra el
+            // canal Fin en el mismo UPDATE del Ini porque esa fila nunca pasa por
+            // FinalizarGestion. El COALESCE deja EnvioFinLLamada intacto (0) para AGENT.
             const string sql = @"
                 UPDATE GSS_OraclePacifico
                 SET JsonIni         = @JsonIni,
                     RespuestaIni    = @JsonRespuestaIni,
                     EnvioIniLLamada = @EnvioIniLLamada,
                     IdOracle        = @IdOracle,
-                    UrlOracle       = @UrlOracle
+                    UrlOracle       = @UrlOracle,
+                    EnvioFinLLamada = COALESCE(@EnvioFinLLamada, EnvioFinLLamada)
                 WHERE LastInteractionId = @LastInteractionId";
 
             var p = new DynamicParameters();
@@ -191,6 +198,7 @@ namespace PacificoSeguros.Infraestructure.Repositories
             p.Add("@EnvioIniLLamada", envioIniLLamada, DbType.Int32);
             p.Add("@IdOracle", idOracle, DbType.Int64);
             p.Add("@UrlOracle", urlOracle, DbType.String);
+            p.Add("@EnvioFinLLamada", envioFinLLamada, DbType.Int32);
             p.Add("@LastInteractionId", lastInteractionId, DbType.String);
 
             try

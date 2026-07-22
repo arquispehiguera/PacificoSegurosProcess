@@ -85,7 +85,7 @@ namespace PacificoSeguros.Infraestructure.Services
         {
             var url = $"{_configuration["OracleApi:BaseUrl"]}{_configuration["OracleApi:FinLlamadaPath"]}/{IdOracle}";
             var subscriptionKey = _configuration["OracleApi:SubscriptionKey"]!;
-            var jsonBody = JsonConvert.SerializeObject(request);
+            var jsonBody = JsonConvert.SerializeObject(request, new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
 
             try
             {

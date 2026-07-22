@@ -16,5 +16,10 @@ namespace PacificoSeguros.Core.Entities
         // (OracleApiClient) para que la propiedad no aparezca en el JSON cuando es null.
         public string? chOptyTipifResultado_c { get; set; }
         public string? chOptyTipifSubResultado_c { get; set; }
+
+        // Solo se setea para Origen=MACHINE, que nunca pasa por FinLlamada — así Oracle
+        // recibe la fecha de fin en el mismo POST. Queda null para AGENT y se omite del
+        // JSON por el mismo NullValueHandling.Ignore.
+        public string? dFin_c { get; set; }
     }
 }
